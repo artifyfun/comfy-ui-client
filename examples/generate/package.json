@@ -6,7 +6,7 @@
     "start": "node dist/main.js"
   },
   "dependencies": {
-    "comfy-ui-client": "workspace:*",
+    "comfy-ui-client": "link:../..",
     "commander": "^11.0.0",
     "uuid": "^9.0.0"
   },

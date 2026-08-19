@@ -55,7 +55,10 @@ export class ComfyUIClientError extends Error {
   /** Raw (parsed) error payload from the server, when available. */
   readonly payload?: unknown;
 
-  constructor(message: string, options?: { status?: number; payload?: unknown }) {
+  constructor(
+    message: string,
+    options?: { status?: number; payload?: unknown },
+  ) {
     super(message);
     this.name = 'ComfyUIClientError';
     this.status = options?.status;
@@ -379,7 +382,7 @@ export interface BinaryPreviewHeader {
 export interface BinaryPreview {
   header: BinaryPreviewHeader;
   /** Image bytes (when eventType === 0), without the 8-byte header. */
-  payload: Buffer;
+  payload: Uint8Array;
 }
 
 /* -------------------------------------------------------------------------- */

@@ -1,9 +1,10 @@
 {
   "name": "@artifyfun/comfy-ui-client",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "packageManager": "pnpm@7.5.0",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "browsers": "defaults, not IE 11"
   },
   "description": "WebSockets API client for ComfyUI",
   "author": "Punnawut Khowkittipaiboon <me@itskaynine.com>",
@@ -41,11 +42,7 @@
     "lint": "eslint .",
     "prettier": "prettier --config .prettierrc --write ./src"
   },
-  "dependencies": {
-    "pino": "^8.14.2",
-    "uuid": "^9.0.0",
-    "ws": "^8.13.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/debug": "^4.1.8",
     "@types/node": "^18.11.14",
@@ -60,5 +57,17 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"
+  },
+  "peerDependencies": {
+    "ws": "^8.13.0",
+    "pino": "^8.14.2"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    },
+    "pino": {
+      "optional": true
+    }
   }
 }

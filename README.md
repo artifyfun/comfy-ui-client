@@ -3,7 +3,9 @@
 [![npm][badge-version]][npm]
 [![license][badge-license]][license]
 
-Node.js [ComfyUI](https://github.com/comfyanonymous/ComfyUI) client based on the [WebSockets API example](https://github.com/comfyanonymous/ComfyUI/blob/master/script_examples/websockets_api_example.py).
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) client based on the [WebSockets API example](https://github.com/comfyanonymous/ComfyUI/blob/master/script_examples/websockets_api_example.py).
+
+**Isomorphic**: works in Node.js (>= 22, or any version with the `ws` package installed) **and** in browsers / Electron renderers. No static Node-only imports — `WebSocket` is the platform global, `fs` is only touched by `saveImages()` (Node-only), and the default logger is `console` (inject any pino-like logger via `options.logger`).
 
 See example in [`examples/generate`][examples-generate].
 
