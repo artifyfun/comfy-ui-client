@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 
-import { ComfyUIClient } from 'comfy-ui-client';
-import type { Prompt } from 'comfy-ui-client';
+import { ComfyUIClient } from '@artifyfun/comfy-ui-client';
+import type { Prompt } from '@artifyfun/comfy-ui-client';
 
 // The ComfyUI server address. May include a scheme (https://, wss://).
 const SERVER_ADDRESS = '127.0.0.1:8188';

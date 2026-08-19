@@ -9,17 +9,17 @@ See example in [`examples/generate`][examples-generate].
 
 ## Install
 
-To install `comfy-ui-client` in an existing project:
+To install `@artifyfun/comfy-ui-client` in an existing project:
 
 ```sh
-npm install comfy-ui-client
+npm install @artifyfun/comfy-ui-client
 ```
 
 ## Example Usage
 
 ```ts
-import { ComfyUIClient } from 'comfy-ui-client';
-import type { Prompt } from 'comfy-ui-client';
+import { ComfyUIClient } from '@artifyfun/comfy-ui-client';
+import type { Prompt } from '@artifyfun/comfy-ui-client';
 
 // Your prompt / workflow
 const prompt: Prompt = {
@@ -196,10 +196,10 @@ Aligned with ComfyUI master (`server.py`):
 
 This project is licensed under the [MIT License][license].
 
-[badge-version]: https://img.shields.io/npm/v/comfy-ui-client.svg
-[badge-license]: https://img.shields.io/npm/l/comfy-ui-client.svg
+[badge-version]: https://img.shields.io/npm/v/@artifyfun/comfy-ui-client.svg
+[badge-license]: https://img.shields.io/npm/l/@artifyfun/comfy-ui-client.svg
 
-[npm]: https://www.npmjs.com/package/comfy-ui-client
-[license]: https://github.com/itsKaynine/comfy-ui-client/blob/main/LICENSE
+[npm]: https://www.npmjs.com/package/@artifyfun/comfy-ui-client
+[license]: https://github.com/artifyfun/comfy-ui-client/blob/main/LICENSE
 
-[examples-generate]: https://github.com/itsKaynine/comfy-ui-client/tree/main/examples/generate
+[examples-generate]: https://github.com/artifyfun/comfy-ui-client/tree/main/examples/generate
