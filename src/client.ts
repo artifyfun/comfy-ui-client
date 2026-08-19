@@ -1,399 +1,700 @@
-import { writeFile } from 'fs/promises';
+
+/**
+ * HTTP + WebSocket client for ComfyUI, aligned with current ComfyUI master
+ * (https://github.com/comfyanonymous/ComfyUI, `server.py`).
+ *
+ * Improvements over the original version:
+ * - Proper WebSocket error / close handling (`connect` rejects on failure).
+ * - Handles `execution_error`, `execution_interrupted` and the new
+ *   `execution_success` completion signal — promises no longer hang forever.
+ * - Progress and per-node callbacks, optional timeout and AbortSignal.
+ * - HTTPS / WSS support and Bearer API-token auth (multi-user servers).
+ * - Newer endpoints: `POST /queue`, `POST /free`, `GET /stats`,
+ *   `POST /object_info`, `GET /history?max_items=`, upload `type`/`subfolder`,
+ *   `/view?channel=`.
+ * - Typed, documented API surface with injectable logger.
+ */
+
+import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 
 import pino from 'pino';
 import WebSocket from 'ws';
 
+import { ComfyUIClientError } from './types.js';
 import type {
+  BinaryPreview,
+  ComfyUIClientEvent,
+  ComfyUIClientOptions,
   EditHistoryRequest,
+  ExecutionErrorData,
+  ExecutionInterruptedData,
+  ExecutionSuccessData,
+  ExecutingData,
   FolderName,
+  FreeRequest,
+  GetImagesOptions,
   HistoryResult,
-  ImageContainer,
-  ImageRef,
+  FileContainer,
   ImagesResponse,
+  ImageRef,
+  LoggerLike,
+  NodeOutput,
   ObjectInfoResponse,
+  OutputFileRef,
+  ProgressData,
   Prompt,
+  PromptHistory,
   PromptQueueResponse,
+  QueueMutationRequest,
   QueuePromptResult,
   QueueResponse,
   ResponseError,
+  StatsResponse,
   SystemStatsResponse,
+  UploadImageOptions,
   UploadImageResult,
   ViewMetadataResponse,
+  ViewParams,
+  WsMessage,
 } from './types.js';
 
-// TODO: Make logger customizable
-const logger = pino({
-  level: 'info',
-});
+type EventHandler = (payload: unknown) => void;
+
+const DEFAULT_TIMEOUT_MS = 60_000;
+
+/**
+ * Parse the 8-byte little-endian header of a binary WS preview message.
+ * Layout: eventType (u8), format (u8), width (u32 LE), height (u32 LE).
+ */
+function parseBinaryPreview(data: Buffer): BinaryPreview {
+  return {
+    header: {
+      eventType: data.readUInt8(0),
+      format: data.readUInt8(1),
+      width: data.readUInt32LE(2),
+      height: data.readUInt32LE(6),
+    },
+    payload: data.subarray(8),
+  };
+}
 
 export class ComfyUIClient {
+  /** Host[:port] of the ComfyUI server, without scheme. */
   public serverAddress: string;
+  /** Session/client id used for the WebSocket connection. */
   public clientId: string;
 
   protected ws?: WebSocket;
+  protected httpBase: string;
+  protected wsBase: string;
+  protected apiToken?: string;
+  protected requestTimeoutMs: number;
+  protected logger: LoggerLike;
+  protected handlers = new Map<ComfyUIClientEvent, Set<EventHandler>>();
 
-  constructor(serverAddress: string, clientId: string) {
-    this.serverAddress = serverAddress;
+  constructor(serverAddress: string, clientId: string, options: ComfyUIClientOptions = {}) {
+    this.serverAddress = serverAddress.replace(/^\w+:\/\//, '');
     this.clientId = clientId;
+    this.apiToken = options.apiToken;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.logger = options.logger ?? pino({ level: 'info' });
+
+    const secure = /^(https|wss):\/\//.test(serverAddress);
+    this.httpBase = `http${secure ? 's' : ''}://${this.serverAddress}`;
+    this.wsBase = `ws${secure ? 's' : ''}://${this.serverAddress}`;
   }
 
-  connect() {
-    return new Promise<void>(async (resolve) => {
-      if (this.ws) {
-        await this.disconnect();
+  /* ---------------------------------------------------------------------- */
+  /* HTTP core                                                              */
+  /* ---------------------------------------------------------------------- */
+
+  /** Low-level JSON request with timeout, auth and error normalization. */
+  protected async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const signal =
+      this.requestTimeoutMs > 0 ? AbortSignal.timeout(this.requestTimeoutMs) : undefined;
+
+    let res: Response;
+    try {
+      res = await fetch(`${this.httpBase}${path}`, {
+        ...init,
+        signal: init.signal ?? signal,
+        headers: {
+          Accept: 'application/json',
+          ...(init.body && !(init.body instanceof FormData)
+            ? { 'Content-Type': 'application/json' }
+            : {}),
+          ...(this.apiToken ? { Authorization: `Bearer ${this.apiToken}` } : {}),
+          ...(init.headers ?? {}),
+        },
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'TimeoutError') {
+        throw new ComfyUIClientError(`Request to ${path} timed out`);
       }
+      throw new ComfyUIClientError(
+        `Request to ${path} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
 
-      const url = `ws://${this.serverAddress}/ws?clientId=${this.clientId}`;
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = text;
+      }
+      throw new ComfyUIClientError(`${path} responded ${res.status} ${res.statusText}`, {
+        status: res.status,
+        payload,
+      });
+    }
 
-      logger.info(`Connecting to url: ${url}`);
+    const body = (await res.json().catch(() => ({}))) as T;
+    const candidate = body as unknown as ResponseError | undefined;
+    if (
+      candidate &&
+      typeof candidate === 'object' &&
+      'error' in candidate &&
+      candidate.error !== undefined &&
+      !(body as Record<string, unknown>).prompt_id
+    ) {
+      throw new ComfyUIClientError(`ComfyUI error on ${path}`, {
+        status: res.status,
+        payload: candidate,
+      });
+    }
+    return body;
+  }
 
-      this.ws = new WebSocket(url, {
+  /* ---------------------------------------------------------------------- */
+  /* WebSocket                                                              */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Open the WebSocket connection to `/ws?clientId=...`.
+   * Rejects on connection failure or timeout.
+   */
+  connect(timeoutMs = 15_000): Promise<void> {
+    this.disconnect();
+
+    const url = `${this.wsBase}/ws?clientId=${encodeURIComponent(this.clientId)}`;
+    this.logger.info({ url }, 'Connecting');
+
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url, {
         perMessageDeflate: false,
+        ...(this.apiToken ? { headers: { Authorization: `Bearer ${this.apiToken}` } } : {}),
       });
+      this.ws = ws;
 
-      this.ws.on('open', () => {
-        logger.info('Connection open');
+      const timer = setTimeout(() => {
+        cleanup();
+        ws.terminate();
+        if (this.ws === ws) this.ws = undefined;
+        reject(new ComfyUIClientError(`WebSocket connection timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      const onOpen = () => {
+        cleanup();
+        this.logger.info('Connection open');
         resolve();
+      };
+      const onError = (err: Error) => {
+        cleanup();
+        if (this.ws === ws) this.ws = undefined;
+        reject(new ComfyUIClientError(`WebSocket connection failed: ${err.message}`));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        ws.off('open', onOpen);
+        ws.off('error', onError);
+      };
+
+      ws.on('open', onOpen);
+      ws.on('error', onError);
+
+      ws.on('close', () => {
+        this.logger.info('Connection closed');
+        if (this.ws === ws) this.ws = undefined;
+        this.emit('disconnected', undefined);
       });
 
-      this.ws.on('close', () => {
-        logger.info('Connection closed');
-      });
-
-      this.ws.on('error', (err) => {
-        logger.error({ err }, 'WebSockets error');
-      });
-
-      this.ws.on('message', (data, isBinary) => {
+      ws.on('message', (data, isBinary) => {
         if (isBinary) {
-          logger.debug('Received binary data');
-        } else {
-          logger.debug('Received data: %s', data.toString());
+          try {
+            this.emit('preview', parseBinaryPreview(Buffer.from(data as Buffer)));
+          } catch {
+            /* ignore malformed previews */
+          }
+          return;
         }
+        let message: WsMessage;
+        try {
+          message = JSON.parse(data.toString());
+        } catch {
+          return;
+        }
+        this.handleWsMessage(message);
       });
     });
   }
 
-  async disconnect() {
+  /** Close the WebSocket connection (idempotent). */
+  disconnect(): void {
     if (this.ws) {
+      this.ws.removeAllListeners();
       this.ws.close();
       this.ws = undefined;
     }
   }
 
+  /** Whether the WebSocket is currently open. */
+  isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  private handleWsMessage(message: WsMessage): void {
+    switch (message.type) {
+      case 'status':
+      case 'progress':
+      case 'executing':
+      case 'executing_cached':
+      case 'execution_start':
+      case 'execution_success':
+      case 'execution_error':
+      case 'execution_interrupted':
+        this.emit(message.type as ComfyUIClientEvent, message.data);
+        break;
+      default:
+        this.logger.debug({ type: message.type }, 'Unhandled WS message');
+    }
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Event emitter                                                          */
+  /* ---------------------------------------------------------------------- */
+
+  /** Subscribe to a WebSocket event (see {@link ComfyUIClientEvent}). */
+  on(event: ComfyUIClientEvent, handler: EventHandler): this {
+    let set = this.handlers.get(event);
+    if (!set) {
+      set = new Set();
+      this.handlers.set(event, set);
+    }
+    set.add(handler);
+    return this;
+  }
+
+
+    /** Unsubscribe from an event. */
+    off(event: ComfyUIClientEvent, handler: EventHandler): this {
+      this.handlers.get(event)?.delete(handler);
+      return this;
+    }
+
+    private emit(event: ComfyUIClientEvent, payload: unknown): void {
+      for (const handler of this.handlers.get(event) ?? []) {
+        try {
+          handler(payload);
+        } catch (err) {
+          this.logger.error({ err, event }, 'Event handler threw');
+        }
+      }
+    }
+
+  /* ---------------------------------------------------------------------- */
+  /* Endpoints                                                              */
+  /* ---------------------------------------------------------------------- */
+
+  /** `GET /embeddings` — available embedding names. */
   async getEmbeddings(): Promise<string[]> {
-    const res = await fetch(`http://${this.serverAddress}/embeddings`);
-
-    const json: string[] | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
+    return this.request<string[]>('/embeddings');
   }
 
+  /** `GET /extensions` — enabled extensions. */
   async getExtensions(): Promise<string[]> {
-    const res = await fetch(`http://${this.serverAddress}/extensions`);
-
-    const json: string[] | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
+    return this.request<string[]>('/extensions');
   }
 
+  /** `GET /system_stats` — system, ComfyUI version and device info. */
+  async getSystemStats(): Promise<SystemStatsResponse> {
+    return this.request<SystemStatsResponse>('/system_stats');
+  }
+
+  /** `GET /stats` — live sampled metrics (newer servers). */
+  async getStats(): Promise<StatsResponse> {
+    return this.request<StatsResponse>('/stats');
+  }
+
+  /** `GET /prompt` — current queue remaining count. */
+  async getPrompt(): Promise<PromptQueueResponse> {
+    return this.request<PromptQueueResponse>('/prompt');
+  }
+
+  /**
+   * `POST /prompt` — queue a workflow (API format) for execution.
+   * Validation failures throw with `node_errors` in the error payload.
+   */
   async queuePrompt(prompt: Prompt): Promise<QueuePromptResult> {
-    const res = await fetch(`http://${this.serverAddress}/prompt`, {
+    return this.request<QueuePromptResult>('/prompt', {
       method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        prompt,
-        client_id: this.clientId,
-      }),
+      body: JSON.stringify({ prompt, client_id: this.clientId }),
     });
-
-    const json: QueuePromptResult | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
   }
 
+  /** `POST /interrupt` — interrupt the currently running prompt. */
   async interrupt(): Promise<void> {
-    const res = await fetch(`http://${this.serverAddress}/interrupt`, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-    });
-
-    const json: QueuePromptResult | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
+    await this.request<unknown>('/interrupt', { method: 'POST' });
   }
 
+  /** `GET /queue` — running and pending queue entries. */
+  async getQueue(): Promise<QueueResponse> {
+    return this.request<QueueResponse>('/queue');
+  }
+
+  /** `POST /queue` — clear the queue or delete specific prompt ids. */
+  async editQueue(params: QueueMutationRequest): Promise<void> {
+    await this.request<unknown>('/queue', { method: 'POST', body: JSON.stringify(params) });
+  }
+
+  /** `POST /free` — unload models and/or free intermediate caches. */
+  async freeMemory(params: FreeRequest): Promise<void> {
+    await this.request<unknown>('/free', { method: 'POST', body: JSON.stringify(params) });
+  }
+
+  /**
+   * `GET /history[/{promptId}]` — execution history.
+   * Result keys are **prompt ids**. `maxItems` limits history size.
+   */
+  async getHistory(promptId?: string, maxItems?: number): Promise<HistoryResult> {
+    const search = maxItems !== undefined ? `?max_items=${maxItems}` : '';
+    return this.request<HistoryResult>(`/history${promptId ? `/${promptId}` : ''}${search}`);
+  }
+
+  /** `POST /history` — clear or delete history entries. */
   async editHistory(params: EditHistoryRequest): Promise<void> {
-    const res = await fetch(`http://${this.serverAddress}/history`, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(params),
-    });
-
-    const json: QueuePromptResult | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
+    await this.request<unknown>('/history', { method: 'POST', body: JSON.stringify(params) });
   }
 
+  /** `GET /object_info[/{nodeClass}]` — node definitions (can be large). */
+  async getObjectInfo(nodeClass?: string): Promise<ObjectInfoResponse> {
+    return this.request<ObjectInfoResponse>(`/object_info${nodeClass ? `/${nodeClass}` : ''}`);
+  }
+
+  /**
+   * `POST /object_info` — fetch node definitions for a subset of node classes
+   * (newer servers; avoids the multi-MB full listing).
+   */
+  async getObjectInfoFor(nodeClasses: string[]): Promise<ObjectInfoResponse> {
+    return this.request<ObjectInfoResponse>('/object_info', {
+      method: 'POST',
+      body: JSON.stringify(nodeClasses),
+    });
+  }
+
+  /** `GET /view_metadata/{folder}` — model metadata (e.g. checkpoint notes). */
+  async viewMetadata(folderName: FolderName, filename: string): Promise<ViewMetadataResponse> {
+    return this.request<ViewMetadataResponse>(
+      `/view_metadata/${folderName}?filename=${encodeURIComponent(filename)}`,
+    );
+  }
+
+  /**
+   * `GET /view` — download an output/temp/input file.
+   * Accepts either a {@link ViewParams} object or positional
+   * `(filename, subfolder, type)` for backwards compatibility.
+   */
+  async getImage(params: ViewParams | string, subfolder?: string, type?: string): Promise<Blob> {
+    const p: ViewParams =
+      typeof params === 'string' ? { filename: params, subfolder, type } : params;
+    const query = new URLSearchParams({
+      filename: p.filename,
+      subfolder: p.subfolder ?? '',
+      type: p.type ?? 'output',
+    });
+    if (p.channel) query.set('channel', p.channel);
+    if (p.download) query.set('download', 'true');
+
+    const headers: Record<string, string> = {};
+    if (this.apiToken) headers.Authorization = `Bearer ${this.apiToken}`;
+
+    let res: Response;
+    try {
+      res = await fetch(`${this.httpBase}/view?${query}`, { headers });
+    } catch (err) {
+      throw new ComfyUIClientError(
+        `/view request failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!res.ok) {
+      throw new ComfyUIClientError(`/view responded ${res.status}`, { status: res.status });
+    }
+    return res.blob();
+  }
+
+  /**
+   * `POST /upload/image`. The third argument also accepts a plain boolean
+   * (`overwrite`) for backwards compatibility.
+   */
   async uploadImage(
     image: Buffer,
     filename: string,
-    overwrite?: boolean,
+    optionsOrOverwrite?: UploadImageOptions | boolean,
   ): Promise<UploadImageResult> {
-    const formData = new FormData();
-    formData.append('image', new Blob([image]), filename);
-
-    if (overwrite !== undefined) {
-      formData.append('overwrite', overwrite.toString());
-    }
-
-    const res = await fetch(`http://${this.serverAddress}/upload/image`, {
-      method: 'POST',
-      body: formData,
-    });
-
-    const json: UploadImageResult | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
+    const options: UploadImageOptions =
+      typeof optionsOrOverwrite === 'boolean'
+        ? { overwrite: optionsOrOverwrite }
+        : (optionsOrOverwrite ?? {});
+    return this.uploadFile('/upload/image', image, filename, options);
   }
 
+  /** `POST /upload/mask`. Pass `options.originalRef` for alpha masks. */
   async uploadMask(
     image: Buffer,
     filename: string,
     originalRef: ImageRef,
-    overwrite?: boolean,
+    optionsOrOverwrite?: UploadImageOptions | boolean,
+  ): Promise<UploadImageResult> {
+    const options: UploadImageOptions =
+      typeof optionsOrOverwrite === 'boolean'
+        ? { overwrite: optionsOrOverwrite }
+        : (optionsOrOverwrite ?? {});
+    return this.uploadFile('/upload/mask', image, filename, { ...options, originalRef });
+  }
+
+  private async uploadFile(
+    path: string,
+    image: Buffer,
+    filename: string,
+    options: UploadImageOptions,
   ): Promise<UploadImageResult> {
     const formData = new FormData();
     formData.append('image', new Blob([image]), filename);
-    formData.append('originalRef', JSON.stringify(originalRef));
+    if (options.overwrite) formData.append('overwrite', 'true');
+    if (options.type) formData.append('type', options.type);
+    if (options.subfolder) formData.append('subfolder', options.subfolder);
+    if (options.originalRef) formData.append('originalRef', JSON.stringify(options.originalRef));
 
-    if (overwrite !== undefined) {
-      formData.append('overwrite', overwrite.toString());
-    }
+    const headers: Record<string, string> = {};
+    if (this.apiToken) headers.Authorization = `Bearer ${this.apiToken}`;
 
-    const res = await fetch(`http://${this.serverAddress}/upload/mask`, {
+    const res = await fetch(`${this.httpBase}${path}`, {
       method: 'POST',
       body: formData,
+      headers,
     });
-
-    const json: UploadImageResult | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new ComfyUIClientError(`${path} responded ${res.status}`, {
+        status: res.status,
+        payload: text,
+      });
     }
-
-    return json;
+    return (await res.json()) as UploadImageResult;
   }
 
-  async getImage(
-    filename: string,
-    subfolder: string,
-    type: string,
-  ): Promise<Blob> {
-    const res = await fetch(
-      `http://${this.serverAddress}/view?` +
-        new URLSearchParams({
-          filename,
-          subfolder,
-          type,
-        }),
-    );
+  /* ---------------------------------------------------------------------- */
+  /* High-level helpers                                                     */
+  /* ---------------------------------------------------------------------- */
 
-    const blob = await res.blob();
-    return blob;
-  }
-
-  async viewMetadata(
-    folderName: FolderName,
-    filename: string,
-  ): Promise<ViewMetadataResponse> {
-    const res = await fetch(
-      `http://${this.serverAddress}/view_metadata/${folderName}?filename=${filename}`,
-    );
-
-    const json: ViewMetadataResponse | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
+  /**
+   * Queue a prompt, wait for completion and download image outputs.
+   *
+   * Resolves on `execution_success` (new servers) or the legacy
+   * `executing` with `node === null` signal; rejects on `execution_error`,
+   * `execution_interrupted`, WebSocket disconnect, timeout or abort.
+   */
+  async getImages(prompt: Prompt, options: GetImagesOptions = {}): Promise<ImagesResponse> {
+    const outputs = await this.getOutputs(prompt, options);
+    const result: ImagesResponse = {};
+    for (const [nodeId, files] of Object.entries(outputs)) {
+      const images = files.filter((f) => this.isImageRef(f.image));
+      if (images.length > 0) result[nodeId] = images;
     }
-
-    return json;
+    return result;
   }
 
-  async getSystemStats(): Promise<SystemStatsResponse> {
-    const res = await fetch(`http://${this.serverAddress}/system_stats`);
-
-    const json: SystemStatsResponse | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
+  /**
+   * Like {@link getImages} but downloads every output kind
+   * (images, videos, audio).
+   */
+  async getOutputs(
+    prompt: Prompt,
+    options: GetImagesOptions = {},
+  ): Promise<Record<string, FileContainer[]>> {
+    const history = await this.waitForPrompt(prompt, options);
+    return this.downloadOutputs(history.outputs);
   }
 
-  async getPrompt(): Promise<PromptQueueResponse> {
-    const res = await fetch(`http://${this.serverAddress}/prompt`);
-
-    const json: PromptQueueResponse | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
-  }
-
-  async getObjectInfo(nodeClass?: string): Promise<ObjectInfoResponse> {
-    const res = await fetch(
-      `http://${this.serverAddress}/object_info` +
-        (nodeClass ? `/${nodeClass}` : ''),
-    );
-
-    const json: ObjectInfoResponse | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
-  }
-
-  async getHistory(promptId?: string): Promise<HistoryResult> {
-    const res = await fetch(
-      `http://${this.serverAddress}/history` + (promptId ? `/${promptId}` : ''),
-    );
-
-    const json: HistoryResult | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
-  }
-
-  async getQueue(): Promise<QueueResponse> {
-    const res = await fetch(`http://${this.serverAddress}/queue`);
-
-    const json: QueueResponse | ResponseError = await res.json();
-
-    if ('error' in json) {
-      throw new Error(JSON.stringify(json));
-    }
-
-    return json;
-  }
-
-  async saveImages(response: ImagesResponse, outputDir: string) {
-    for (const nodeId of Object.keys(response)) {
-      for (const img of response[nodeId]) {
-        const arrayBuffer = await img.blob.arrayBuffer();
-
-        const outputPath = join(outputDir, img.image.filename);
-        await writeFile(outputPath, Buffer.from(arrayBuffer));
-      }
-    }
-  }
-
-  async getImages(prompt: Prompt): Promise<ImagesResponse> {
+  /**
+   * Queue a prompt and wait for completion, resolving with its history entry
+   * (outputs are not downloaded).
+   */
+  async waitForPrompt(prompt: Prompt, options: GetImagesOptions = {}): Promise<PromptHistory> {
     if (!this.ws) {
-      throw new Error(
-        'WebSocket client is not connected. Please call connect() before interacting.',
-      );
+      throw new Error('WebSocket client is not connected. Please call connect() first.');
     }
 
     const queue = await this.queuePrompt(prompt);
     const promptId = queue.prompt_id;
 
-    return new Promise<ImagesResponse>((resolve, reject) => {
-      const outputImages: ImagesResponse = {};
+    return new Promise<PromptHistory>((resolve, reject) => {
+      let settled = false;
 
-      const onMessage = async (data: WebSocket.RawData, isBinary: boolean) => {
-        // Previews are binary data
-        if (isBinary) {
-          return;
-        }
-
-        try {
-          const message = JSON.parse(data.toString());
-          if (message.type === 'executing') {
-            const messageData = message.data;
-            if (!messageData.node) {
-              const donePromptId = messageData.prompt_id;
-
-              logger.info(`Done executing prompt (ID: ${donePromptId})`);
-
-              // Execution is done
-              if (messageData.prompt_id === promptId) {
-                // Get history
-                const historyRes = await this.getHistory(promptId);
-                const history = historyRes[promptId];
-
-                // Populate output images
-                for (const nodeId of Object.keys(history.outputs)) {
-                  const nodeOutput = history.outputs[nodeId];
-                  if (nodeOutput.images) {
-                    const imagesOutput: ImageContainer[] = [];
-                    for (const image of nodeOutput.images) {
-                      const blob = await this.getImage(
-                        image.filename,
-                        image.subfolder,
-                        image.type,
-                      );
-                      imagesOutput.push({
-                        blob,
-                        image,
-                      });
-                    }
-
-                    outputImages[nodeId] = imagesOutput;
-                  }
-                }
-
-                // Remove listener
-                this.ws?.off('message', onMessage);
-                return resolve(outputImages);
-              }
-            }
-          }
-        } catch (err) {
-          return reject(err);
-        }
+      const cleanup = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        this.off('execution_success', onSuccess);
+        this.off('executing', onExecuting);
+        this.off('progress', onProgress);
+        this.off('execution_error', onError);
+        this.off('execution_interrupted', onInterrupted);
+        this.off('disconnected', onDisconnected);
+        options.signal?.removeEventListener('abort', onAbort);
       };
 
-      // Add listener
-      this.ws?.on('message', onMessage);
+      const finish = (ok: boolean, err?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (!ok) {
+          reject(err ?? new ComfyUIClientError('Execution failed'));
+          return;
+        }
+        // Fetch history; retry briefly in case the server has not flushed yet.
+        void (async () => {
+          try {
+            let entry: PromptHistory | undefined;
+            for (let attempt = 0; attempt < 10 && !entry; attempt++) {
+              if (attempt > 0) await new Promise((r) => setTimeout(r, 200));
+              entry = (await this.getHistory(promptId))[promptId];
+            }
+            if (!entry) {
+              reject(new ComfyUIClientError(`History for ${promptId} not found`));
+            } else {
+              resolve(entry);
+            }
+          } catch (e) {
+            reject(e instanceof Error ? e : new ComfyUIClientError(String(e)));
+          }
+        })();
+      };
+
+      const matches = (data: { prompt_id?: string }) =>
+        data.prompt_id === undefined || data.prompt_id === promptId;
+
+      const onSuccess = (data: unknown) => {
+        if (matches(data as ExecutionSuccessData)) finish(true);
+      };
+
+      const onExecuting = (data: unknown) => {
+        const d = data as ExecutingData;
+        if (!matches(d)) return;
+        options.onExecuting?.(d);
+        // Legacy completion signal: `executing` with node === null.
+        if (d.node === null || d.node === undefined) finish(true);
+      };
+
+      const onProgress = (data: unknown) => {
+        const d = data as ProgressData;
+        if (matches(d)) options.onProgress?.(d);
+      };
+
+      const onError = (data: unknown) => {
+        const d = data as ExecutionErrorData;
+        if (!matches(d)) return;
+        finish(
+          false,
+          new ComfyUIClientError(
+            `Execution failed at node ${d.node_id} (${d.node_type}): ${d.exception_message}`,
+            { payload: d },
+          ),
+        );
+      };
+
+      const onInterrupted = (data: unknown) => {
+        const d = data as ExecutionInterruptedData;
+        if (!matches(d)) return;
+        finish(false, new ComfyUIClientError('Execution interrupted', { payload: d }));
+      };
+
+      const onDisconnected = () => {
+        finish(false, new ComfyUIClientError('WebSocket disconnected while waiting'));
+      };
+
+      const onAbort = () => finish(false, new ComfyUIClientError('Aborted'));
+
+      const timer =
+        options.timeoutMs && options.timeoutMs > 0
+          ? setTimeout(
+              () =>
+                finish(
+                  false,
+                  new ComfyUIClientError(`Prompt timed out after ${options.timeoutMs}ms`),
+                ),
+              options.timeoutMs,
+            )
+          : undefined;
+
+      this.on('execution_success', onSuccess);
+      this.on('executing', onExecuting);
+      this.on('progress', onProgress);
+      this.on('execution_error', onError);
+      this.on('execution_interrupted', onInterrupted);
+      this.on('disconnected', onDisconnected);
+      options.signal?.addEventListener('abort', onAbort);
     });
+  }
+
+  /** Download all files referenced by history node outputs (in parallel). */
+  protected async downloadOutputs(
+    outputs: Record<string, NodeOutput>,
+  ): Promise<Record<string, FileContainer[]>> {
+    const result: Record<string, FileContainer[]> = {};
+    const jobs: Array<Promise<void>> = [];
+
+    for (const [nodeId, nodeOutput] of Object.entries(outputs)) {
+      const refs: OutputFileRef[] = [
+        ...(nodeOutput.images ?? []),
+        ...(nodeOutput.videos ?? nodeOutput.gifs ?? []),
+        ...(nodeOutput.audio ?? []),
+      ];
+      if (refs.length === 0) continue;
+      result[nodeId] = [];
+      for (const ref of refs) {
+        jobs.push(
+          (async () => {
+            const blob = await this.getImage(ref.filename, ref.subfolder, ref.type);
+            result[nodeId].push({ blob, image: ref });
+          })(),
+        );
+      }
+    }
+    await Promise.all(jobs);
+    return result;
+  }
+
+  /** Heuristic: is this history ref an image (vs video/audio)? */
+  private isImageRef(ref: OutputFileRef): boolean {
+    if (ref.format) return ref.format.startsWith('image/');
+    return !/\.(mp4|webm|mkv|mp3|wav|flac|ogg|m4a)$/i.test(ref.filename);
+  }
+
+  /** Save downloaded outputs to disk in parallel, preserving subfolders. */
+  async saveImages(response: ImagesResponse, outputDir: string): Promise<void> {
+    const jobs: Array<Promise<void>> = [];
+    for (const files of Object.values(response)) {
+      for (const img of files) {
+        jobs.push(
+          (async () => {
+            const dir = join(outputDir, img.image.subfolder);
+            await mkdir(dir, { recursive: true });
+            await writeFile(join(dir, img.image.filename), Buffer.from(await img.blob.arrayBuffer()));
+          })(),
+        );
+      }
+    }
+    await Promise.all(jobs);
   }
 }

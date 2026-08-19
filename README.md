@@ -90,22 +90,107 @@ prompt['3'].inputs.seed = 5;
 
 // Create client
 const serverAddress = '127.0.0.1:8188';
+// Create client (options are optional)
+const serverAddress = '127.0.0.1:8188'; // or https://comfy.example.com
 const clientId = 'baadbabe-b00b-4206-9420-deadd00d1337';
-const client = new ComfyUIClient(serverAddress, clientId);
+const client = new ComfyUIClient(serverAddress, clientId, {
+  // apiToken: '...',           // Bearer auth for multi-user servers
+  // requestTimeoutMs: 60000,   // HTTP request timeout (default 60s)
+  // logger: console,           // inject your own pino-like logger
+});
 
-// Connect to server
+// Connect to server (rejects on failure / timeout)
 await client.connect();
 
-// Generate images
-const images = await client.getImages(prompt);
+// Generate images with progress reporting, per-node callbacks,
+// and a timeout. Rejects on execution_error / interrupted /
+// disconnect / timeout instead of hanging forever.
+const images = await client.getImages(prompt, {
+  timeoutMs: 10 * 60_000,
+  onProgress: (p) => console.log(`progress: ${p.value}/${p.max}`),
+  onExecuting: (d) => {
+    if (d.node) console.log(`executing node ${d.node}`);
+  },
+});
 
-// Save images to file
+// Save images to file (parallel, preserves subfolders)
 const outputDir = './tmp/output';
 await client.saveImages(images, outputDir);
 
 // Disconnect
-await client.disconnect();
+client.disconnect();
 ```
+
+## API
+
+### Client options
+
+```ts
+new ComfyUIClient(serverAddress, clientId, options?)
+```
+
+| Option                     | Type        | Default        | Description                                            |
+| -------------------------- | ----------- | -------------- | ------------------------------------------------------ |
+| `serverAddress`            | `string`    | —              | `host:port`; `http(s)://` / `ws(s)://` detected automatically |
+| `clientId`                 | `string`    | —              | Session id used on the WebSocket connection            |
+| `options.apiToken`         | `string`    | —              | Sent as `Authorization: Bearer` (multi-user servers)   |
+| `options.requestTimeoutMs` | `number`    | `60000`        | Per-request HTTP timeout; `0` disables                 |
+| `options.logger`           | `LoggerLike`| pino (`info`)  | pino-like logger (`console` works)                     |
+
+### High-level helpers
+
+- `connect(timeoutMs?)` / `disconnect()` / `isConnected()` — WebSocket lifecycle. `connect` rejects on connection failure or timeout.
+- `getImages(prompt, options?)` — queue a workflow, wait for completion, download **image** outputs.
+- `getOutputs(prompt, options?)` — same, but downloads **all** output kinds (images, videos, audio).
+- `waitForPrompt(prompt, options?)` — queue and wait, resolving with the history entry (no downloads).
+- `saveImages(images, outputDir)` — write downloaded outputs to disk in parallel, preserving subfolders.
+
+`GetImagesOptions`:
+
+| Option        | Type                        | Description                                      |
+| ------------- | --------------------------- | ------------------------------------------------ |
+| `timeoutMs`   | `number`                    | Overall execution timeout (`0`/undefined = none) |
+| `onProgress`  | `(p: ProgressData) => void` | Sampling progress (`value` / `max`)              |
+| `onExecuting` | `(d: ExecutingData) => void`| Node execution events (`node === null` = done)   |
+| `signal`      | `AbortSignal`               | Cancel waiting (does not stop server execution)  |
+
+### Events
+
+`client.on(event, handler)` / `client.off(event, handler)`:
+
+`status`, `progress`, `executing`, `executing_cached`, `execution_start`,
+`execution_success`, `execution_error`, `execution_interrupted`,
+`preview` (parsed binary previews), `disconnected`.
+
+### HTTP endpoints
+
+- `getEmbeddings()`, `getExtensions()`
+- `getSystemStats()`, `getStats()` (newer servers)
+- `getPrompt()` — queue remaining
+- `queuePrompt(prompt)`, `interrupt()`
+- `getQueue()`, `editQueue({ clear?, delete?, delete_iterative? })`
+- `freeMemory({ unload_models?, free_memory? })` — `POST /free`
+- `getHistory(promptId?, maxItems?)`, `editHistory({ clear?, delete? })`
+- `getObjectInfo(nodeClass?)`, `getObjectInfoFor(nodeClasses[])` — subset via `POST /object_info` (newer servers)
+- `viewMetadata(folderName, filename)`
+- `getImage({ filename, subfolder, type, channel?, download? })` — `GET /view`; also accepts positional `(filename, subfolder, type)`
+- `uploadImage(image, filename, { overwrite?, type?, subfolder? }?)`
+- `uploadMask(image, filename, originalRef, { overwrite? }?)`
+
+All failures throw `ComfyUIClientError` with `.status` (HTTP status, when
+applicable) and `.payload` (raw server error, e.g. `node_errors`).
+
+### Compatibility notes
+
+Aligned with ComfyUI master (`server.py`):
+
+- Completion is detected via the `execution_success` WS message (new servers)
+  with fallback to the legacy `executing` + `node === null` signal.
+- History keys are **prompt ids**; outputs include `images`, `videos`
+  (formerly `gifs`), and `audio`.
+- Binary WS previews are parsed (8-byte header: event type, format, width,
+  height) and emitted as `preview` events.
+
 
 ## License
 
